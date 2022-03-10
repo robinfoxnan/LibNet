@@ -1,38 +1,30 @@
+# LibNet库说明
 
-# LibNet网络库
-
-
-## 设计目的
+## 一、设计目的
 用c++11写一个轻量级跨平台（windows，linux, mac )的高性能网络库，用于高速的rpc调用；
+grpc和brpc对于小型应用还是太笨重了，而且brpc不跨平台；之前用过libuv二次开发做rpc调用，但是毕竟还是需要一个外部库，这个库希望以源码形式全部集成到项目中；
+
+
+## 二、参考与引用
+在设计思路与原理上参考了其他的一些库：
+1. muduo ： 陈硕写的linux异步库，缺点是使用了boost，而且不支持其他平台；
+2. zsummerX：  log4z的作者发布的源码；
+3. libuv：nodejs底层库；
+   
+
+集成的第三方源码：
+1. log4z : 做了部分更改；
+2. log4cpp: 目前只有包装器，可以通过配置启动该模块；
+3. uvcpp的日志部分；
+4. http_parser: nodejs中早期的解析器，我测试对比了LLHTTP解析器，并没有发现新版的更快，所以还是使用http_parser；
 
 
 
-## 参考：
-
-1、muduo ： 陈硕写的linux异步库，缺点是使用了boost，而且不支持其他平台；
-2、handy :  
-3、zsummerX：  log4z的作者发布的源码；
-4、libuv：nodejs底层库；
-5、
-
-## 集成的第三方源码：
-
-1、log4z :
-2、log4cpp: 
-3、uvcpp的日志部分：
-4、http_parser: 
-
-## 一、总体设计
-
-**
-
-**设计原则**：尽可能少的使用第三方二进制库，保证整体代码可以以源码形式嵌入到目标工程中；优先考虑linux的系统特性，兼容windows特性；
+## 三、总体设计
 
 **结构如下图所示**：
 
-![](doc\image\total.png)
-
-
+![](doc/image/total.png)
 
 
 
@@ -42,149 +34,228 @@
 
 2)  在loop内的线程的socket都在线程上工作，不需要考虑线程安全问题；（个别用户异步命令需要投递到线程上处理，类似libuv）;
 
-3）单个循环上socket的操作不进行线程切换，
+3）单个循环上socket的操作不进行线程切换，减少线程切换的代价；
 
 
 
+适用场景：
 
+1）单个任务处理时间短，非CPU密集型操作，如果是属于CPU密集型计算，则需要单独添加计算任务管理部分，将任务放到单独的线程池中计算；
 
-## 一、Channel
-
-### 1.1 定义
-
-Channel 描述一个socket或者异步文件描述符；
-
-在linux中文件、管道、套接字都使用int 类型；
-而windows中使用SOCKET来描述；
-这里统一重定义为socket_t类型；
-
-Channel是包含3个成员：
-
-```c++
-socket_t fd_;   // 文件描述符
-int      event; // 关心的事件掩码
-int      revent;// 当前已经发生的事件
-```
-
-Socket继承了此类，仅仅是添加了一些设置Socket相关的操作；而读写等一些方法并没有放进去；
-
-### 1.2 生命周期与释放
-
-Channel归属Connection来管理，或者Server来管理，本身是shared_ptr，但是在IPoll中管理时，以及IOEventPoll分发当前事件时，却使用了原始的指针类型Channel *，这是因为考虑到shared_ptr会消耗更多的资源；比如一个服务器，需要上万个连接，消耗还是挺大的；
-
-但是需要保证Channel的生命周期结束时，必须已经从IOEventLoop中移除了，否则，后续使用指针就会崩溃；
-
-隐含条件是：IOEventLoop的生命周期长，持续整个涉及IO的全过程，不能先退出！！！
-
-各个使用IOEventLoop的地方也都是使用裸指针，因为隐含的生命周期保证了一定是可用的！！！
+2）目前编写了Http Client作为示例，实现http1.1的客户端基本功能，包括：同步、异步、流水线方式访问服务端，同时对部分模型（除了IOCP）使用openssl支持https
 
 
 
-redis中没有考虑这些东西，因为整个就是一个线程在工作，所以没有啥线程安全需要考虑的。
+## 四、使用示例
 
-## 二、SocketsAPi
-不同平台的socket使用方法不近相同，这里对读写进行了重新封装；
+### 4.1 TcpConnection使用
 
+见 /test/testTcpConn.cpp 示例如何使用tcp客户端，
 
+实现了发送http请求，等待服务器响应并关闭连接；
 
-
-## 三、IPoller
-
-IPoller是用来检查socket中是否存在事件需要处理的类；几乎所有的异步IO库都是使用一个线程池使用一个检查类来干这个；比如Redis中每种事件驱动模型定义了单独的驱动类
+备注：http协议，对于Apache服务器host字段必须的，其他字段可有可无；另外有些服务器限制更加宽松；
 
 ```c++
-ae_select.c
+static std::atomic<bool> bExit{ false };
+TcpConnectionPtr  conn = nullptr;
+std::string content;
+char buffer[4096];
+void onClose(const TcpConnectionPtr& connection)
+{
+	printf("server close socket\n");
+	conn = nullptr;
+	bExit = true;
+}
 
-ae_epoll.c
+void onAllocBuffer(const TcpConnectionPtr &conn, char * *data, size_t *sz, void **pVoid)
+{
+	*data = buffer;
+	*sz = 4096;
+	*pVoid = nullptr;
+}
+
+void onReadData(const TcpConnectionPtr &conn, char * data, size_t sz, void *pVoid)
+{
+    printf("recv:%zu, \n %s \n", sz, data);
+}
+
+void onWriteEnd(const TcpConnectionPtr &conn, const char * data, size_t sz, void *pVoid, int status)
+{
+	printf("send %zu \n", sz);
+}
+
+int main(int argc, char *argv[])
+{
+	// 线程池设置为1
+	LibNet::EventLoopThreadPool::instance().Init(1).start();
+
+    string ip = "10.128.6.129";
+	int port = 80;
+	conn = std::make_shared<TcpConnection>(ip, 80);
+	conn->setClientCallback(onAllocBuffer, onReadData, onWriteEnd, onClose);
+
+	std::cout << "start to connect:" << ip << ":" <<port << endl;
+	bool ret = conn->connectSyn(3);
+
+	if (ret == false)
+	{
+		printf("connect error\n");
+		bExit = true;
+	}
+	else
+	{
+		printf("connect ok\n");
+	}
+
+	//Utils::sleepFor(2000);
+	content =
+		"GET /1.html HTTP/1.1\r\n"
+		"Host: 127.0.0.1\r\n"
+		"Connection: close\r\n"
+		"Content-Type: text/html\r\n"
+		"\r\n";
+
+	conn->send(content.c_str(), content.length(), 0);
+	
+	while (!bExit)
+	{
+		Utils::sleepFor(1000);
+	}
+
+	conn = nullptr;
+	LibNet::EventLoopThreadPool::instance().stop();
+
+	return 0;
+}
 ```
 
-一般是一个种类实现一个单独的类；而该类实现的功能非常的简单
+说明：
 
-- updateChannel ：添加描述符，设置关心的事件；
-- removeChannel ：移除描述符，
--  poll ：查询描述符中当前是否有事件；
+在OnRead回调之前，之所以有一个OnAlloc回调，是参考libuv的设计思路，给一个机会让用户自己管理内存，并且减少内存反复拷贝的次数；如果用户设置为空指针，则TcpConnection会还是使用内部的Buffer类管理读内存；这个类是陈硕写的，我做了少量更改；这个Buffer类精巧的地方就是头部预留部分字节用于填充协议头部，方便解析；
 
-IPoll定义了一个内部成员
+### 4.2 同步使用http client
+
+见 test/testClientSyn.cpp 
+
+同步方式使用http目录下的http客户端访问服务：
 
 ```c++
-std::map<socket_t, Channel *> channels_;
+string body = R"({ "age": 5 })";
+
+void testSynGet()
+{
+	LibNet::EventLoopThreadPool::instance().Init(1).start();
+
+	string ip = "127.0.0.1";
+    int port = 80;
+	HttpClient httpClient(ip, port);
+    // open ssl, open https://127.0.0.1:443/1.html
+    //httpClient.setHttpsMode();
+    
+    httpClient.setCmdTimeout(5);
+
+	int count = 0;
+	int N = 300;
+    char path[260];
+	for (int i = 0; i < N; i++)
+	{		
+        snprintf(path, 260, "/test1.php?id=%d", i + 1);
+		int64_t id = httpClient.Get(path);
+		if (id > 0)
+		{
+			printf("id = %lld, code = %d, body = {%s} \n",
+				id, 
+				httpClient.getResponse()->code,
+				httpClient.getResponse()->body.c_str());
+		}
+		else
+		{
+			int err = httpClient.getLastErr();
+			if (err == Error::Unreachable)
+			{
+				N = i;
+				printf("id = %d cant'connect host= %s:%d, exit here \n",
+					i+1, ip.c_str(), port);
+				break;
+			}
+			else if (err == Error::Timeout)
+			{
+				printf("id = %d timeout\n", i + 1);
+			}
+			else
+			{
+				printf("id = %d err = %d\n", i + 1, err);
+			}
+		}
+	}
+
+	httpClient.closeConnection();
+	LibNet::EventLoopThreadPool::instance().stop();
+}
 ```
 
-之所以需要此成员，是因为IPooler需要在获取了socket上的事件后，需要与socket对应的上下文对应起来；在IOEventloop中分发事件，调用回调函数；
-
-poll、epoll、select等模型都么有这样的机制；
-
-而IOCP模型则太需要，因为IOCP直接绑定socket与完成端口，并且关联了上下文，并且是线程安全的；
-
-##  
 
 
+### 4.3 异步使用http client
 
+见 test/testClientSpeedAsyn.cpp
 
+异步方式使用http目录下的http客户端访问服务：
 
-四、windows与linux系统的select区别
+目前没有实现服务端，apache满足不了需求，使用了go的服务端，见tools目录；
 
-fd_set在2种操作系统下的实现方式差别比较大：
+### 4.4 流水线方式使用http client
 
-linux下面定义，对宏翻译后大概是这样的：
+见 test/testClientSpeedPipeLine.cpp
 
-```c++
-typedef struct
-  {
-    // 支持1024个文件描述符，而用bit作为掩码使用，每个long是64位，所以除以64
-    long int fds_bits[1024 / (8 * 8))];  
-  } fd_set;
-```
+流水线方式使用http目录下的http客户端访问服务：
 
-所以使用掩码方式可以直接按比特位进行设置，和删除；
-
-```c
-int select(int nfds, fd_set *readfds, fd_set *writefds,
-                  fd_set *exceptfds, struct timeval *timeout);
-```
-
-man手册中说明，nfds并不是我们设置了多少个socket，而是最大的fd + 1;
-
-这是因为
-
-1）socket本身就是int从小到大的使用，当设置了最大的，最大值可以保证小的都被覆盖；
-
-2）按照掩码方式使用，设置了大值，之前的都是需要监测的；
+目前没有实现服务端，使用了go的服务端，见tools目录；
 
 
 
-windows不同：
+### 4.5 部分性能测试
 
-```c++
-#define FD_SETSIZE      64
-#endif /* FD_SETSIZE */
+对于目前我的需求来说，异步方式已经强于cpp_httplib和curl异步方式（https://github.com/robinfoxnan/HttpClientCurl）；
 
-typedef struct fd_set {
-        u_int fd_count;               /* how many are SET? */
-        SOCKET  fd_array[FD_SETSIZE];   /* an array of SOCKETs */
-} fd_set;
-```
+流水线方式可以避免网络时延对调用POST或者GET的性能影响，curl目前的版本似乎并不再支持此选项；
 
-这里使用了一个很土的数组，加上一个使用的个数；
+我使用的测试环境为DELL笔记本，window10 pro，vmware开ubuntu18.04, 4核i7-11,16G RAM
 
-设置时候是
+测试一、在windows上开启go的http server， 从ubuntu发起1K数据包请求，ping时延0.5ms,
 
-1）监测是否设置了；
+使用select模型，测试结果如下：
 
-2）如果找不到，则追加；
-
-删除的时候是：
-
-1）找到当前位置；
-
-2）逐个向前挪动；
-
-效率比linux的方式低了很多啊，
-
-所以在使用select时候nfds的设置其实就是实际添加了多少个socket；
+| 参数         | 异步rps | 流水线(pipelining)   rps |
+| ------------ | ------- | ------------------------ |
+| 1线程，1连接 | 2.5k    | 2.1w                     |
+| 3线程，3连接 | 1.1w    | 4.8w                     |
+| 3线程，9连接 | 2.1w    | 6.7w                     |
 
 
 
-**总结：为啥微软不采用掩码方式实现？是微软太笨么？**
+后续做了其他相关测试，测试结果发现：
 
-**不是，是因为windows下socket的值并不是从小到大的一个递增的小整数，值可能会非常的大，所以不能使用小数组实现掩码。**
+Select模型比EPoll和Poll快；
+
+Select模型比IOCP快；
+
+确实十分惊讶，经过网络信息也印证了实验结果，对于少量的socket连接（1~10），select模型更加简单，需要管理的socket列表不需要系统调用即可实现；而epoll和IOCP明显动作更多；IOCP尤其是每次调用明明可以一次完成确需要回调通知，浪费更多的CPU资源；
+
+结论：对于客户端来说，少量的连接即可满足上报数据，以及RPC等功能，使用Select模型更加合适；
+
+
+
+## 五、后续工作
+
+实现tcp server部分，
+
+实现http server;
+
+一个人的力量有限，测试不可能特别充分，如果测试中发现问题请及时反馈。
+
+
+
+
+
